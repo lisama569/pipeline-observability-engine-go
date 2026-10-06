@@ -51,6 +51,7 @@ const (
 	ReasonNone      FailureReason = ""          // 正常并入
 	ReasonExpired   FailureReason = "expired"   // 超出迟到容忍窗口
 	ReasonStale     FailureReason = "stale"     // 数据滞后
+	ReasonStuck     FailureReason = "stuck"     // 任务卡住（无进展）
 	ReasonTimeout   FailureReason = "timeout"   // 任务运行超时
 	ReasonFailed    FailureReason = "failed"    // 任务执行失败
 	ReasonDuplicate FailureReason = "duplicate" // 重复投递（不计数）

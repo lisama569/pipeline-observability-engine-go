@@ -2,6 +2,7 @@ package pipelineobs
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -19,8 +20,11 @@ type snapshot struct {
 	Tasks map[string]*taskState `json:"tasks"`
 	// Incidents 告警事件单（含已恢复的历史轮次），键为告警 Key。
 	Incidents map[string]*incidentState `json:"incidents"`
-	// Silences 静默规则，键为告警 Key；globalSilenceKey 表示全局静默。
-	Silences map[string]silenceState `json:"silences"`
+	// SilenceRules 按范围生效的静默规则，键为规则 ID。
+	SilenceRules map[string]silenceRule `json:"silence_rules"`
+	// Silences 为 v1 持久化格式遗留字段；加载 v1 快照时迁移成 SilenceRules，
+	// 新写入恒为空（自定义 JSON 解码完成迁移）。
+	Silences map[string]silenceState `json:"silences,omitempty"`
 
 	// SeenEvents 已处理事件 ID -> 首次接入处理时间，用于幂等去重。
 	SeenEvents map[string]time.Time `json:"seen_events"`
@@ -70,6 +74,11 @@ type taskState struct {
 	ErrorMessage string    `json:"error_message"`
 	Running      bool      `json:"running"`
 
+	// LastProgressAt 为该任务最近一次“有进展”的处理时间（单调有效时间）：
+	// 任务开始事件接入时置位；同算子此后任何被接受的记录/水位/任务事件
+	// 都会刷新它。卡住判定只看它与 EffectiveNow 的差，无需任何新数据。
+	LastProgressAt time.Time `json:"last_progress_at"`
+
 	// TimeoutAlerted 标记本轮运行是否已产生过超时告警（抑制刷屏）。
 	TimeoutAlerted bool `json:"timeout_alerted"`
 	// FailAlerted 标记本轮运行是否已产生过失败告警。
@@ -94,17 +103,55 @@ type incidentState struct {
 	// Notified 标记当前 firing 轮次是否已对外产生过一条有效告警。
 	// 抑制窗口内重复条件成立只刷新 LastFiredAt，不再产生新告警。
 	Notified bool `json:"notified"`
+
+	// Muted 标记当前 firing 轮次是否正被某条静默规则覆盖。
+	// 只在 false->true（开始被静默）与 true->false（覆盖解除/到期，
+	// 且问题仍在）两种跳变上驱动通知口径：进入静默时不补发；
+	// 静默全部解除时复位 Notified，使持续中的问题能重新发出一条告警。
+	Muted bool `json:"muted"`
 }
 
-// silenceState 是一条静默规则。
+// silenceState 是 v1 格式的静默规则（仅用于旧快照迁移）。
 type silenceState struct {
 	// Until 为零值表示永久静默；否则到该处理时间为止。
 	Until time.Time `json:"until"`
 	Note  string    `json:"note"`
 }
 
-// globalSilenceKey 是全局静默规则在 Silences 中的键。
-const globalSilenceKey = "*"
+// SilenceScope 标识一条静默规则的作用范围层级（口径唯一）。
+type SilenceScope string
+
+const (
+	// ScopeGlobal 全局：静默所有告警（所有流水线/算子/原因）。
+	ScopeGlobal SilenceScope = "global"
+	// ScopePipeline 整条流水线：静默该流水线下所有算子、所有原因。
+	ScopePipeline SilenceScope = "pipeline"
+	// ScopeOperator 单个算子：静默该算子名下所有原因
+	// （如算子名下所有任务失败、所有任务卡住）。
+	ScopeOperator SilenceScope = "operator"
+	// ScopeCause 单算子 + 单原因（含单次任务失败，由 TaskID 精确定位）。
+	ScopeCause SilenceScope = "cause"
+)
+
+// silenceRule 是一条按范围生效的静默规则（持久化）。
+//
+// 范围口径（更宽的范围字段留空）：
+//   - global:     Pipeline/Operator/Cause/TaskID 全空；
+//   - pipeline:   Pipeline 非空，其余空；
+//   - operator:   Pipeline+Operator 非空，Cause/TaskID 空；
+//   - cause:      Pipeline+Operator+Cause 非空；TaskID 非空时进一步
+//     精确到单次任务失败告警。
+type silenceRule struct {
+	ID       string       `json:"id"`
+	Scope    SilenceScope `json:"scope"`
+	Pipeline string       `json:"pipeline,omitempty"`
+	Operator string       `json:"operator,omitempty"`
+	Cause    Cause        `json:"cause,omitempty"`
+	TaskID   string       `json:"task_id,omitempty"`
+	// Until 为零值表示永久静默；否则到该处理时间为止（now >= Until 失效）。
+	Until time.Time `json:"until"`
+	Note  string    `json:"note,omitempty"`
+}
 
 func newSnapshot() *snapshot {
 	return &snapshot{
@@ -112,6 +159,7 @@ func newSnapshot() *snapshot {
 		Buckets:       map[string]*bucketState{},
 		Tasks:         map[string]*taskState{},
 		Incidents:     map[string]*incidentState{},
+		SilenceRules:  map[string]silenceRule{},
 		Silences:      map[string]silenceState{},
 		SeenEvents:    map[string]time.Time{},
 		ExpiredEvents: map[string]time.Time{},
@@ -120,11 +168,19 @@ func newSnapshot() *snapshot {
 	}
 }
 
-// normalizeAfterLoad 补齐旧版本/空快照中可能为 nil 的 map，
-// 并校验持久化格式版本，保证重启恢复后内存结构可直接使用。
+// normalizeAfterLoad 补齐空快照中可能为 nil 的 map，并把旧持久化格式
+// 迁移到当前版本，保证重启恢复后内存结构可直接使用。
 func (s *snapshot) normalizeAfterLoad() error {
-	if s.Version != snapshotVersion {
-		return fmt.Errorf("snapshot: unsupported version %d (want %d)", s.Version, snapshotVersion)
+	switch s.Version {
+	case 1:
+		if err := s.migrateV1Silences(); err != nil {
+			return err
+		}
+		s.Version = snapshotVersion
+	case snapshotVersion:
+		// 已是当前版本。
+	default:
+		return fmt.Errorf("snapshot: unsupported version %d (want <= %d)", s.Version, snapshotVersion)
 	}
 	if s.Buckets == nil {
 		s.Buckets = map[string]*bucketState{}
@@ -135,9 +191,10 @@ func (s *snapshot) normalizeAfterLoad() error {
 	if s.Incidents == nil {
 		s.Incidents = map[string]*incidentState{}
 	}
-	if s.Silences == nil {
-		s.Silences = map[string]silenceState{}
+	if s.SilenceRules == nil {
+		s.SilenceRules = map[string]silenceRule{}
 	}
+	s.Silences = nil // 迁移完成后不再以旧格式写回。
 	if s.SeenEvents == nil {
 		s.SeenEvents = map[string]time.Time{}
 	}
@@ -195,4 +252,50 @@ func (s *snapshot) ensureBucket(pipe, op string, start time.Time, size time.Dura
 		s.Buckets[key] = b
 	}
 	return b
+}
+
+// migrateV1Silences 把 v1 的键值静默规则迁移为 v2 的结构化范围规则。
+//
+// v1 只有两类键："*" 表示全局；其余为精确告警键 pipeline|operator|cause，
+// 失败键形如 pipeline|operator|task_failed|<TaskID>。
+func (s *snapshot) migrateV1Silences() error {
+	rules := map[string]silenceRule{}
+	for key, sil := range s.Silences {
+		r, err := parseLegacySilenceKey(key, sil)
+		if err != nil {
+			return fmt.Errorf("snapshot: migrate v1 silence %q: %w", key, err)
+		}
+		rules[r.ID] = r
+	}
+	s.SilenceRules = rules
+	return nil
+}
+
+// parseLegacySilenceKey 解析 v1 静默键（"*" 或 pipe|op|cause[|taskID]）。
+func parseLegacySilenceKey(key string, sil silenceState) (silenceRule, error) {
+	if key == "*" {
+		return silenceRule{ID: silenceRuleID(ScopeGlobal, "", "", "", ""), Scope: ScopeGlobal,
+			Until: sil.Until, Note: sil.Note}, nil
+	}
+	parts := strings.Split(key, "|")
+	if len(parts) < 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return silenceRule{}, fmt.Errorf("unexpected legacy key shape")
+	}
+	pipe, op, cause := parts[0], parts[1], Cause(parts[2])
+	if len(parts) > 3 {
+		taskID := strings.Join(parts[3:], "|")
+		if cause != CauseFailed {
+			return silenceRule{}, fmt.Errorf("task-qualified key with cause %s", cause)
+		}
+		return silenceRule{
+			ID: silenceRuleID(ScopeCause, pipe, op, cause, taskID), Scope: ScopeCause,
+			Pipeline: pipe, Operator: op, Cause: cause, TaskID: taskID,
+			Until: sil.Until, Note: sil.Note,
+		}, nil
+	}
+	return silenceRule{
+		ID: silenceRuleID(ScopeCause, pipe, op, cause, ""), Scope: ScopeCause,
+		Pipeline: pipe, Operator: op, Cause: cause,
+		Until: sil.Until, Note: sil.Note,
+	}, nil
 }

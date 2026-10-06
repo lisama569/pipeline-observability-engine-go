@@ -36,6 +36,7 @@ func main() {
 		AllowedLateness:    20 * time.Second,
 		StalenessThreshold: 30 * time.Second,
 		TaskTimeout:        90 * time.Second,
+		TaskStuckThreshold: 45 * time.Second,
 		SuppressWindow:     time.Minute,
 	}
 
@@ -120,6 +121,44 @@ func main() {
 		clk.Set(base.Add(150 * time.Second))
 		ingest(pipelineobs.Event{ID: "t1-fin", Pipeline: "p1", Operator: "agg", Kind: pipelineobs.KindTaskFinished, TaskID: "task-1", OccurredAt: base.Add(145 * time.Second)})
 
+		// 8) 任务卡住（无进展）：任务起后不接任何事件，只推进真实时钟。
+		ingest(pipelineobs.Event{ID: "t3-start", Pipeline: "p1", Operator: "watch", Kind: pipelineobs.KindTaskStarted, TaskID: "task-3", OccurredAt: base.Add(150 * time.Second)})
+		clk.Set(base.Add(200 * time.Second))
+		if r, err := eng.ObserveTime(ctx); err != nil {
+			log.Fatal(err)
+		} else {
+			for _, a := range r.Alerts {
+				if a.Cause == pipelineobs.CauseStuck {
+					fmt.Printf("[卡住判定] %s\n", a.Message)
+				}
+			}
+		}
+
+		// 9) 按范围静默：整条算子 watch 静默 20s（卡住只压通知、内部仍 firing）。
+		if err := eng.SilenceOperator("p1", "watch", 20*time.Second, "值班维护"); err != nil {
+			log.Fatal(err)
+		}
+		clk.Set(base.Add(210 * time.Second))
+		if r, err := eng.ObserveTime(ctx); err != nil {
+			log.Fatal(err)
+		} else if len(r.Alerts) != 0 {
+			log.Fatalf("静默期内不应外发，got %d", len(r.Alerts))
+		}
+		fmt.Printf("[范围静默] watch 算子静默中：活动告警仍含卡住=%t（只压通知）\n",
+			hasActiveCause(eng.ActiveAlerts(), pipelineobs.CauseStuck))
+
+		// 静默到期（200+20=220s）：卡住仍未恢复 -> 重新报警。
+		clk.Set(base.Add(220 * time.Second))
+		if r, err := eng.ObserveTime(ctx); err != nil {
+			log.Fatal(err)
+		} else {
+			for _, a := range r.Alerts {
+				if a.Cause == pipelineobs.CauseStuck {
+					fmt.Printf("[静默到期重新报警] %s\n", a.Message)
+				}
+			}
+		}
+
 		log.Printf("快照已写入 %s，再次运行本程序可验证重启恢复（告警不刷屏、不丢失）。\n", snapPath)
 	} else {
 		log.Println("=== 重启恢复：未恢复告警与静默状态延续 ===")
@@ -138,10 +177,21 @@ func main() {
 			r.Verdict.Duplicate, r.Verdict.Reason, len(eng.ActiveAlerts()))
 	}
 
-	fmt.Println("\n=== 聚合窗口 ===")
-	for _, b := range eng.Buckets() {
-		fmt.Printf("pipe=%s op=%-6s window=[%s,%s) closed=%t records=%d bytes=%d tasks(start/finish/fail)=%d/%d/%d\n",
-			b.Pipeline, b.Operator, b.WindowStart.Format("15:04:05"), b.WindowEnd.Format("15:04:05"),
-			b.Closed, b.RecordCount, b.ByteCount, b.TaskStarted, b.TaskFinished, b.TaskFailed)
+	fmt.Println("\n=== 运行健康汇总（按流水线/算子聚合，只读，与活动告警同源）===")
+	for _, ph := range eng.HealthSummary() {
+		for _, oh := range ph.Operators {
+			fmt.Printf("pipe=%-3s op=%-7s stuck=%-5t stale=%-5t firing=%d causes=%v\n",
+				ph.Pipeline, oh.Operator, oh.Stuck, oh.Stale, oh.FiringCount, oh.Causes)
+		}
 	}
+}
+
+// hasActiveCause 判断活动告警中是否存在指定原因。
+func hasActiveCause(alerts []pipelineobs.Alert, cause pipelineobs.Cause) bool {
+	for _, a := range alerts {
+		if a.Cause == cause {
+			return true
+		}
+	}
+	return false
 }

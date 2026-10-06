@@ -10,7 +10,12 @@ import (
 )
 
 // snapshotVersion 是当前持久化格式版本。
-const snapshotVersion = 1
+//
+//	v1：Silences map[告警键]silenceState（仅全局/精确键两种）。
+//	v2：SilenceRules map[规则ID]silenceRule（按 pipeline/operator/cause/task
+//	    范围生效），事件单新增 Muted，任务新增 LastProgressAt。
+//	加载 v1 快照时自动迁移 Silences -> SilenceRules。
+const snapshotVersion = 2
 
 // Store 是状态持久化抽象。引擎在每次改变状态后调用 Save，
 // 启动时调用 Load 恢复。实现必须保证重启后状态完整延续。

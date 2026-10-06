@@ -103,3 +103,34 @@ func (e *Engine) ActiveAlerts() []Alert {
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
 }
+
+// OperatorHealth 是单个算子的运行健康汇总（只读视图）。
+//
+// 所有字段均直接派生自当前 firing 事件单，因此与逐条接入得到的判定、
+// ActiveAlerts() 严格一致：乱序、延迟到达、重启恢复后不会各说各话。
+type OperatorHealth struct {
+	Pipeline, Operator string
+
+	// Stuck / Stale 表示该算子当前是否存在 firing 的
+	// “任务卡住 / 数据滞后”根因（任务超时、任务失败计入 FiringCount）。
+	Stuck bool
+	Stale bool
+
+	// FiringCount 该算子当前 firing 告警的条数（含卡住/滞后/超时/失败）。
+	FiringCount int
+	// Causes 该算子当前 firing 的全部原因码（去重、排序）。
+	Causes []Cause
+}
+
+// PipelineHealth 是单条流水线的运行健康汇总（只读视图），
+// 由其名下全部算子聚合得到。
+type PipelineHealth struct {
+	Pipeline string
+	// Stuck / Stale 为该流水线下任一算子命中即为 true。
+	Stuck bool
+	Stale bool
+	// FiringCount 该流水线当前 firing 告警总条数。
+	FiringCount int
+	// Operators 该流水线下全部算子的健康明细，按算子名排序。
+	Operators []OperatorHealth
+}

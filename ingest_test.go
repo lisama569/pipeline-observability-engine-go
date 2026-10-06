@@ -31,6 +31,7 @@ func testCfg() Config {
 		AllowedLateness:    20 * time.Second,
 		StalenessThreshold: 30 * time.Second,
 		TaskTimeout:        90 * time.Second,
+		TaskStuckThreshold: 45 * time.Second,
 		SuppressWindow:     time.Minute,
 	}
 }

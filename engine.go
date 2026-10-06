@@ -23,6 +23,13 @@ type Config struct {
 	// 达到该值时，仍在运行的任务判定超时（>= 边界成立）。
 	TaskTimeout time.Duration
 
+	// TaskStuckThreshold 任务无进展（卡死）阈值：任务起后，按单调有效的
+	// 处理时间计，距该任务最近一次任何事件进展（数据记录、显式水位、
+	// 任务自身的开始/结束事件）达到该值仍未结束，即判定任务卡住（>= 边界成立）。
+	// 与数据滞后的区别：只要求真实时钟往前走、完全没有任何新事件也能判出；
+	// 与超时的区别：不依赖事件时间水位推进。
+	TaskStuckThreshold time.Duration
+
 	// SuppressWindow 告警抑制窗口（保留配置项；当前状态机口径为同一
 	// firing 轮次恒只通知一条，恢复后重新恶化方可再次触发）。
 	SuppressWindow time.Duration
@@ -35,6 +42,7 @@ func DefaultConfig() Config {
 		AllowedLateness:    30 * time.Second,
 		StalenessThreshold: 2 * time.Minute,
 		TaskTimeout:        5 * time.Minute,
+		TaskStuckThreshold: 3 * time.Minute,
 		SuppressWindow:     10 * time.Minute,
 	}
 }
@@ -77,6 +85,24 @@ func Open(ctx context.Context, cfg Config, clock Clock, store Store) (*Engine, e
 	// 若恢复出来的 EffectiveNow 落后于当前时钟，则追平时钟。
 	if now := e.clock.Now(); now.After(e.state.EffectiveNow) {
 		e.state.EffectiveNow = now
+	}
+	// 回填在途任务的进展锚点（旧版本快照没有该字段）。
+	// 若该算子重启前已有 firing 的卡住事件单，则它是“重启前就卡住、尚未恢复”
+	// 的状态：保持零锚点不动，事件单经持久化延续，不会因重启重复刷屏、也不会丢；
+	// 否则以最近有效接入处理时间（缺失则当前有效时间）作保守锚点，避免“重启即
+	// 误报卡住”，同时持续无进展超过阈值后仍能判出。
+	for _, t := range e.state.Tasks {
+		if !t.Running || !t.LastProgressAt.IsZero() {
+			continue
+		}
+		if inc := e.state.Incidents[alertKey(t.Pipeline, t.Operator, CauseStuck)]; inc != nil && inc.State == StateFiring {
+			continue
+		}
+		anchor := e.state.LastIngest[operatorKey(t.Pipeline, t.Operator)]
+		if anchor.IsZero() {
+			anchor = e.state.EffectiveNow
+		}
+		t.LastProgressAt = anchor
 	}
 	e.logf("engine opened: restored=%t buckets=%d tasks=%d incidents=%d",
 		store != nil && e.state.SavedAt != time.Time{}, len(e.state.Buckets),
@@ -240,11 +266,22 @@ func (e *Engine) classifyAndApplyLocked(ev Event, now time.Time) (IngestResult, 
 		t.FinishedAt = ev.OccurredAt
 		t.Failed = ev.Failed
 		t.ErrorMessage = ev.ErrorMessage
+		// 结束本身是该任务的最后一次进展。
+		t.LastProgressAt = now
 		if ev.Failed {
 			b.TaskFailed++
 		}
 	case KindWatermark:
 		// 仅推进水位，无记录计数。
+	}
+
+	// 卡住判定的“进展”口径：同算子任何被接受的事件（数据记录、显式水位、
+	// 该算子的任务事件）都算该算子名下仍在运行任务的一次进展；过期/重复
+	// 事件在更早的分支已返回，不会走到这里，因此不会制造虚假进展。
+	for _, t := range s.Tasks {
+		if t.Running && t.Pipeline == ev.Pipeline && t.Operator == ev.Operator {
+			t.LastProgressAt = now
+		}
 	}
 
 	// 窗口内事件时间范围（迟到并入也如实反映）。
