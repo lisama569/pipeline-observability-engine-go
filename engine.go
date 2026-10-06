@@ -23,6 +23,12 @@ type Config struct {
 	// 达到该值时，仍在运行的任务判定超时（>= 边界成立）。
 	TaskTimeout time.Duration
 
+	// StuckThreshold 任务卡死（无进展）阈值：任务仍在运行，且其算子
+	// 距最近一次有效事件（按单调有效处理时间）达到该阈值即判卡死
+	// （>= 边界成立）。与数据滞后、任务超时相互独立。
+	// 值 <= 0 表示关闭卡死判定（兼容旧配置零值）。
+	StuckThreshold time.Duration
+
 	// SuppressWindow 告警抑制窗口（保留配置项；当前状态机口径为同一
 	// firing 轮次恒只通知一条，恢复后重新恶化方可再次触发）。
 	SuppressWindow time.Duration
@@ -35,6 +41,7 @@ func DefaultConfig() Config {
 		AllowedLateness:    30 * time.Second,
 		StalenessThreshold: 2 * time.Minute,
 		TaskTimeout:        5 * time.Minute,
+		StuckThreshold:     3 * time.Minute,
 		SuppressWindow:     10 * time.Minute,
 	}
 }
@@ -127,6 +134,12 @@ func (e *Engine) Ingest(ctx context.Context, ev Event) (IngestResult, error) {
 	if err := e.persistLocked(ctx); err != nil {
 		return res, fmt.Errorf("engine: persist: %w", err)
 	}
+	e.logAlertsLocked(now, fired, recovered)
+	return res, nil
+}
+
+// logAlertsLocked 统一打印告警触发/恢复日志（调用方持锁）。
+func (e *Engine) logAlertsLocked(now time.Time, fired, recovered []Alert) {
 	for _, a := range fired {
 		e.logf("ALERT FIRED key=%s cause=%s sev=%s fireCount=%d msg=%q",
 			a.Key, a.Cause, a.Severity, a.FireCount, a.Message)
@@ -134,7 +147,6 @@ func (e *Engine) Ingest(ctx context.Context, ev Event) (IngestResult, error) {
 	for _, a := range recovered {
 		e.logf("ALERT RECOVERED key=%s cause=%s at=%s", a.Key, a.Cause, now.Format(time.RFC3339))
 	}
-	return res, nil
 }
 
 // classifyAndApplyLocked 完成去重、过期判定、统计并入（调用方持锁）。
@@ -222,6 +234,7 @@ func (e *Engine) classifyAndApplyLocked(ev Event, now time.Time) (IngestResult, 
 			s.Tasks[ev.TaskID] = &taskState{
 				TaskID: ev.TaskID, Pipeline: ev.Pipeline, Operator: ev.Operator,
 				StartedAt: ev.OccurredAt, Running: true,
+				LastActivityAt: now, // 开始事件本身即首次活动
 			}
 		}
 		// 任务已存在（例如 finished 先到、started 迟到，或同 ID 重投）时
@@ -262,6 +275,15 @@ func (e *Engine) classifyAndApplyLocked(ev Event, now time.Time) (IngestResult, 
 	for _, bk := range s.Buckets {
 		if !bk.Closed && !newWM.Before(bk.WindowEnd) {
 			bk.Closed = true
+		}
+	}
+
+	// 6) 该算子任何有效事件都算“有进展”：刷新其在途任务的活动时间，
+	//    卡死判定据此重新计时（任务结束事件也会先刷新再置 Running=false，
+	//    不影响结论：Running=false 后不再参与卡死判定）。
+	for _, t := range s.Tasks {
+		if t.Running && t.Pipeline == ev.Pipeline && t.Operator == ev.Operator {
+			t.LastActivityAt = now
 		}
 	}
 

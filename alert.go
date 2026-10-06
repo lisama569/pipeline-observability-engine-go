@@ -2,6 +2,7 @@ package pipelineobs
 
 import (
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -20,6 +21,7 @@ const (
 	CauseStale   Cause = "data_stale"   // 数据滞后
 	CauseTimeout Cause = "task_timeout" // 任务运行超时
 	CauseFailed  Cause = "task_failed"  // 任务执行失败
+	CauseStuck   Cause = "task_stuck"   // 任务卡死（运行中但算子完全无进展）
 )
 
 // AlertState 告警（事件单）生命周期状态。
@@ -98,11 +100,75 @@ func (e *Engine) evaluateAlerts(now time.Time, touchedOps map[string]bool) (fire
 		// 失败：任务以 Failed=true 结束。任务事件不可变，每个任务实例
 		// 用独立的失败根因键（含 TaskID），天然“一轮一条”，重启恢复后
 		// Notified 仍为 true，不会重复刷屏；下一个失败任务是新键，可再次触发。
+		// FailAlerted 仅在真正对外通知后置位：若失败发生时处于静默期，
+		// 后续评估会重试，静默解除后仍可补发这一次失败。
 		if !t.Running && t.Failed && !t.FailAlerted {
-			t.FailAlerted = true
 			if a := e.fireOnce(now, t, fmt.Sprintf("任务 %s 执行失败：%s", t.TaskID, t.ErrorMessage)); a != nil {
 				fired = append(fired, *a)
 			}
+		}
+	}
+
+	// 3) 任务卡死（无进展）：任务仍在运行，且其算子距最近一次有效事件
+	//    （单调有效处理时间）达到 StuckThreshold。与数据滞后（无任何接入，
+	//    不要求有在途任务）、任务超时（事件时间水位口径）严格区分：
+	//    即使完全没有新事件、只有真实时钟前进，ObserveTime 也会判出。
+	//    StuckThreshold <= 0 时该判定关闭（兼容旧配置零值）。
+	if e.cfg.StuckThreshold > 0 {
+		// 同一算子可能有多个在途任务：先按算子聚合，结论对每个算子唯一，
+		// 与 map 遍历顺序无关。
+		type stuckInfo struct {
+			stuck   bool
+			taskIDs []string
+			maxIdle time.Duration
+		}
+		byOp := map[string]*stuckInfo{}
+		for _, t := range s.Tasks {
+			if !t.Running || t.LastActivityAt.IsZero() {
+				continue
+			}
+			opK := operatorKey(t.Pipeline, t.Operator)
+			info := byOp[opK]
+			if info == nil {
+				info = &stuckInfo{}
+				byOp[opK] = info
+			}
+			idle := now.Sub(t.LastActivityAt)
+			// 边界口径：无进展时长“等于”阈值即判卡死（>=）。
+			if idle >= e.cfg.StuckThreshold {
+				info.stuck = true
+				info.taskIDs = append(info.taskIDs, t.TaskID)
+				if idle > info.maxIdle {
+					info.maxIdle = idle
+				}
+			}
+		}
+		// 也要让“曾在途、现已全部结束”的算子从 firing 恢复：对出现过
+		// 卡死事件单的算子统一评估。卡死事件单键即 alertKey(pipe,op,CauseStuck)。
+		for _, inc := range s.Incidents {
+			if inc.Cause != CauseStuck {
+				continue
+			}
+			opK := operatorKey(inc.Pipeline, inc.Operator)
+			if _, ok := byOp[opK]; !ok {
+				byOp[opK] = &stuckInfo{}
+			}
+		}
+		opKeys := make([]string, 0, len(byOp))
+		for k := range byOp {
+			opKeys = append(opKeys, k)
+		}
+		sort.Strings(opKeys)
+		for _, opK := range opKeys {
+			info := byOp[opK]
+			pipe, op := splitOperatorKey(opK)
+			sort.Strings(info.taskIDs)
+			msg := fmt.Sprintf("任务卡死：算子 %d 个在途任务无进展（任务 %v），距最近有效事件 %s 达到阈值 %s",
+				len(info.taskIDs), info.taskIDs, info.maxIdle.Truncate(time.Millisecond), e.cfg.StuckThreshold)
+			a, r := e.applyCondition(now, pipe, op, alertKey(pipe, op, CauseStuck),
+				CauseStuck, SeverityCritical, info.stuck, msg)
+			fired = append(fired, a...)
+			recovered = append(recovered, r...)
 		}
 	}
 	return fired, recovered
@@ -129,9 +195,16 @@ func (e *Engine) applyCondition(now time.Time, pipe, op, key string, cause Cause
 		inc.LastFiredAt = now
 		// 抑制口径：同一 firing 轮次只通知一次；SuppressWindow 不另开
 		// 新轮次（状态机未恢复就不算新根因），因此窗口内外都不刷屏。
-		if !inc.Notified && !e.isSilenced(key, now) {
+		// 例外：若上一轮评估时本事件单处于静默覆盖下（Silenced=true），
+		// 静默解除（到期/手动移除）后只要条件仍成立，必须补发一条——
+		// 不能因为“以前报过一次”或“静默期错过了”就一直不出声。
+		_, silenced := e.silencedRule(inc, now)
+		if !silenced && (!inc.Notified || inc.Silenced) {
 			inc.Notified = true
+			inc.Silenced = false
 			fired = append(fired, inc.toAlert(msg))
+		} else {
+			inc.Silenced = silenced
 		}
 		return fired, nil
 	}
@@ -147,6 +220,8 @@ func (e *Engine) applyCondition(now time.Time, pipe, op, key string, cause Cause
 }
 
 // fireOnce 处理一次性的任务失败告警（每个 TaskID 一个根因键）。
+// 真正对外通知时才置 Notified 与任务上的 FailAlerted；静默期内不通知，
+// 解除后由后续评估补发。
 func (e *Engine) fireOnce(now time.Time, t *taskState, msg string) *Alert {
 	s := e.state
 	key := failureAlertKey(t.Pipeline, t.Operator, t.TaskID)
@@ -156,35 +231,49 @@ func (e *Engine) fireOnce(now time.Time, t *taskState, msg string) *Alert {
 			Key: key, Pipeline: t.Pipeline, Operator: t.Operator, Cause: CauseFailed,
 			Severity: SeverityCritical, State: StateFiring,
 			FirstFiredAt: now, LastFiredAt: now, FireCount: 1,
+			TaskID: t.TaskID,
 		}
 		s.Incidents[key] = inc
 	}
 	inc.LastFiredAt = now
-	// 重启后 Notified 已持久化为 true：不重复发出。
-	if inc.Notified || e.isSilenced(key, now) {
+	_, silenced := e.silencedRule(inc, now)
+	if silenced {
+		inc.Silenced = true
+		return nil
+	}
+	// 重启后 Notified 已持久化为 true：不重复发出；但静默刚解除且本轮
+	// 尚未有效通知过时，允许补发一次。
+	if inc.Notified && !inc.Silenced {
 		return nil
 	}
 	inc.Notified = true
+	inc.Silenced = false
+	t.FailAlerted = true
 	a := inc.toAlert(msg)
 	return &a
 }
 
-// isSilenced 判断告警键在 now 时刻是否被静默（专属静默或全局静默）。
-// 到期的静默规则即时清理；边界口径：now >= Until 即失效。
-func (e *Engine) isSilenced(key string, now time.Time) bool {
+// silencedRule 返回当前时刻覆盖该事件单、且最具体的生效静默规则 ID。
+// 多条规则同时命中时效果为“并集”（任一命中即静默），返回哪一条由
+// 具体程度（specificity）降序、规则 ID 升序唯一确定，便于观测与解释。
+// 到期的规则在此惰性清理；边界口径：now >= Until 即失效。
+func (e *Engine) silencedRule(inc *incidentState, now time.Time) (string, bool) {
 	s := e.state
-	muted := func(k string) bool {
-		sil, ok := s.Silences[k]
-		if !ok {
-			return false
-		}
+	bestID := ""
+	bestScore := -1
+	for id, sil := range s.Silences {
 		if !sil.Until.IsZero() && !now.Before(sil.Until) {
-			delete(s.Silences, k)
-			return false
+			delete(s.Silences, id)
+			continue
 		}
-		return true
+		if !sil.matches(inc) {
+			continue
+		}
+		if score := sil.specificity(); score > bestScore || (score == bestScore && id < bestID) {
+			bestID, bestScore = id, score
+		}
 	}
-	return muted(globalSilenceKey) || muted(key)
+	return bestID, bestScore >= 0
 }
 
 // toAlert 把持久化事件单转为对外告警视图。

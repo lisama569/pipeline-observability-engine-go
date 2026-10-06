@@ -96,12 +96,13 @@
 
 ## 3. 新鲜度与任务时效判定
 
-三类异常使用三种**不同原因码**（`FailureReason` / 告警 `Cause`），绝不混淆：
+四类异常使用四种**不同原因码**（`FailureReason` / 告警 `Cause`），绝不混淆：
 
 | 现象 | 原因码 | 判定依据 | 边界口径 |
 |---|---|---|---|
 | 数据滞后 | `data_stale` / `ReasonStale` | `EffectiveNow − 该算子最近一次有效接入时间` | **≥ `StalenessThreshold` 即滞后** |
 | 任务运行超时 | `task_timeout` / `ReasonTimeout` | `算子事件时间水位 − 任务开始事件时间`，任务仍在运行 | **≥ `TaskTimeout` 即超时** |
+| 任务卡死（无进展） | `task_stuck` | `EffectiveNow − 该任务所属算子最近一次有效事件的处理时间`，任务仍在运行 | **≥ `StuckThreshold` 即卡死** |
 | 任务执行失败 | `task_failed` / `ReasonFailed` | `task_finished` 事件带 `Failed=true` | 一次性事实 |
 
 要点：
@@ -112,7 +113,37 @@
 - **数据滞后基于单调有效处理时间**：回拨不会让滞后误恢复，恢复前进也不会
   让滞后误重复（`TestClockRollbackStability`）。
 - 没有新事件时可周期性调用 `Engine.ObserveTime()`，仅推进观察时刻并重评
-  滞后/超时；接入新事件后会顺带评估该算子的滞后状态。
+  滞后/超时/卡死；接入新事件后会顺带评估该算子的滞后状态。
+
+### 3.1 任务卡死（`task_stuck`）语义
+
+卡死针对的是「任务起了之后算子彻底静默」的场景：没有任何新数据、没有结束
+事件，**只有真实时钟在走**。它与滞后、超时的区别：
+
+- **数据滞后**只要求「算子没新接入」，不要求有在途任务；**卡死**要求存在
+  仍在运行的任务，是任务级结论。
+- **超时**由事件时间水位驱动（数据流还在走、只是任务跑得久）；**卡死**由
+  处理时间驱动（数据流本身停了）。同一任务可以同时超时且卡死，两条事件单
+  各自独立。
+
+判定细节：
+
+- 每个在途任务记录 `LastActivityAt`：任务开始事件的处理时间为初始值，之后
+  该算子**任何一条有效接入事件**（含记录、水位、其他任务事件）都刷新它。
+- 条件：`任务在运行 且 EffectiveNow − LastActivityAt ≥ StuckThreshold`。
+  边界口径唯一：**恰好等于阈值那一次即判卡死**（`TestStuckFiresOnWallClockOnly`）。
+- 同一算子多个在途任务共享一条 `pipeline|operator|task_stuck` 事件单：
+  任一任务卡死即成立，告警消息列出全部卡死任务 ID；结论按算子聚合，
+  与任务遍历顺序无关。
+- **时钟回拨不抖**：`EffectiveNow` 单调不减，无进展时长不会回退，回拨期间
+  不误恢复、不重复告警（`TestStuckStableUnderClockRollback`）。
+- **重启延续**：`LastActivityAt` 与事件单都持久化，重启后未恢复的卡死
+  原样保留，不丢、不重复刷屏（`TestStuckSurvivesRestart`）。
+- **自动恢复**：任务重新有产出（算子任一有效事件）或正常结束时，卡死结论
+  自动恢复；之后再次卡住会开启新一轮重新告警
+  （`TestStuckRecoversOnProgressAndFinish`）。
+- **兼容开关**：`StuckThreshold <= 0`（含旧配置零值）时卡死判定整体关闭，
+  行为与旧版完全一致（`TestStuckDisabledWhenThresholdZero`）。
 
 ---
 
@@ -142,18 +173,44 @@
 
 ### 4.3 静默（Silence）
 
-- `Silence(pipeline, operator, cause, ttl, note)`：静默某一根因；
-  全空参数表示**全局静默**。`SilenceFailure(...)` 可精确静默某次任务失败。
-- `ttl=0` 表示永久静默，否则从当前有效时间起持续 `ttl`；到期边界口径为
-  观察时刻 `now >= Until` 时规则立即失效（惰性删除）。
-- 静默只抑制「对外通知」，**不影响状态机推进**：静默期间触发的告警在快照里
-  仍是 `firing`，重启后延续；静默解除后该轮若仍未通知过，会补发这一轮的
-  唯一一条告警（`TestSilenceSuppressesAndExpires`）。
+静默只抑制「对外通知」，**不影响状态机推进与持久化**：静默期间触发/持续的
+告警在快照里仍是 `firing`，重启后延续。
+
+**规则形态**（匹配口径唯一确定）：
+
+- `Silence(pipeline, operator, cause, ttl, note)`：逐根因精确静默；
+  全空参数表示**全局静默**。`SilenceFailure(...)` 精确静默某次任务失败。
+- `SilenceScoped(SilenceScope{Pipeline, Operator, Cause, TaskID}, ttl, note)`：
+  **按范围静默**。空字段为通配，非空字段全部相等才命中：
+  - 仅 `Pipeline`：静默整条流水线的全部问题；
+  - `Pipeline+Operator`：静默该算子名下全部问题（各 cause、各任务实例），
+    **已正在报的与静默期内新冒出来的同类问题都覆盖**；
+  - 再叠加 `Cause` / `TaskID`：进一步收窄到某一类问题 / 某次任务失败。
+  - 范围相同则规则 ID 相同，重复添加为幂等覆盖；`RemoveSilenceRule(id)`
+    手动解除；`ListSilences()` 查看全部未到期规则。
+
+**多范围同时命中**：效果为并集——任一未到期规则命中即静默，不存在
+「有的生效有的不生效」。需要解释「被哪条规则压住」时，取具体程度最高
+（精确键 > 匹配字段多者）、并列按规则 ID 字典序，结果唯一确定
+（`TestOverlappingScopesDeterministic`）。
+
+**到期与重报**：
+
+- `ttl=0` 永久静默，否则从当前有效时间起持续 `ttl`；边界口径为观察时刻
+  `now >= Until` 即失效（惰性清理）。
+- **静默到期或被手动解除后，只要问题仍在 firing，下一次评估必须重新发出
+  一条告警**——即使该 firing 轮次在静默前已经通知过一次。实现上事件单
+  记录 `Silenced` 位：上次评估处于静默覆盖、本次不再覆盖且条件仍成立，
+  即补发（同一轮次，FireCount 不变）。「又来一轮新的恶化」则按状态机
+  正常开启新一轮、FireCount+1。
+- 静默期内发生且被压住的任务失败，在静默解除后的下一次评估补发
+  （`TestOperatorScopeSilenceCoversTaskFailures`）。
 
 ### 4.4 重启后的行为（`TestRestartContinuesAlertsAndDedup`）
 
 - 未恢复（`firing`）的告警原样恢复，重新评估时**不重复发通知**。
-- 静默规则原样恢复并继续生效/到期。
+- 静默规则（含范围静默）原样恢复并继续生效/到期
+  （`TestScopedSilenceSurvivesRestart`）。
 - 已处理 / 已过期事件 ID 集合恢复，历史事件重放一律判重，统计不变。
 
 ---
@@ -167,9 +224,29 @@
   新的完整快照，不会读到半截文件。
 - 写入时机：每次成功接入、`ObserveTime` 后以及增删静默规则后整体覆写；
   `Close` 再刷一次。测试规模数据量下足够；store 传 `nil` 可纯内存运行。
-- 快照内容：窗口聚合、任务、告警事件单（含历史轮次与 `Notified`）、静默规则、
-  已处理/已过期事件 ID、各算子水位与最近接入时间、`EffectiveNow`。
+- 快照内容：窗口聚合、任务（含 `LastActivityAt`）、告警事件单（含历史轮次、
+  `Notified`、`Silenced`）、静默规则（精确键与范围规则）、已处理/已过期
+  事件 ID、各算子水位与最近接入时间、`EffectiveNow`。
 - 启动时若 `EffectiveNow` 落后于当前时钟则追平时钟，保证重启后时间单调。
+- **旧版快照兼容**：格式版本仍为 1，新字段均为 JSON 可选字段；旧快照中的
+  逐根因静默条目在加载时自动迁移为「精确键匹配」规则，语义不变
+  （`normalizeAfterLoad`）。`StuckThreshold` 在旧配置中为零值，卡死判定
+  自动关闭，因此旧配置 + 旧快照的行为与升级前完全一致。
+
+---
+
+## 5.1 运行健康汇总（`Engine.Health()`）
+
+只读视图，按「流水线 → 算子」两级聚合，供值班一眼看清当前状态：
+
+- 算子级：是否卡死（`Stuck`）、是否数据滞后（`Stale`）、在途任务数、
+  活动告警数、firing 原因集合；流水线级为各算子的并集/求和。
+- **一致性口径**：汇总完全由已持久化的事件单（firing 状态）与任务状态
+  推导，与 `ActiveAlerts()`、逐条接入的判定结果严格对得上；乱序、延迟
+  到达、重启恢复后都不各说各话（`TestHealthMatchesActiveAlerts`、
+  `TestHealthConsistentAfterOutOfOrderAndRestart`）。
+- 汇总本身不推进时间、不修改状态；要刷新时效类结论（滞后/超时/卡死）
+  先调用 `ObserveTime()` 再看汇总。
 
 ---
 
@@ -181,6 +258,7 @@
 | `AllowedLateness` | 迟到容忍窗口；`事件时间 >= 水位−该值` 并入旧窗口，更早的判过期 | `30s` |
 | `StalenessThreshold` | 数据新鲜度阈值；`有效现在 − 最近接入 >= 该值` 判数据滞后 | `2m` |
 | `TaskTimeout` | 任务超时阈值；`事件时间水位 − 任务开始 >= 该值` 且仍运行判超时 | `5m` |
+| `StuckThreshold` | 卡死阈值；`有效现在 − 算子最近有效事件 >= 该值` 且有在途任务判卡死；`<=0` 关闭 | `3m` |
 | `SuppressWindow` | 告警抑制窗口配置项；状态机口径为同一 firing 轮次恒只通知一条 | `10m` |
 
 所有阈值均要求正数（`WindowSize` 非法时 `Open` 直接报错）。

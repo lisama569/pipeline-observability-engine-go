@@ -36,6 +36,7 @@ func main() {
 		AllowedLateness:    20 * time.Second,
 		StalenessThreshold: 30 * time.Second,
 		TaskTimeout:        90 * time.Second,
+		StuckThreshold:     45 * time.Second,
 		SuppressWindow:     time.Minute,
 	}
 
@@ -119,6 +120,40 @@ func main() {
 		// 7) 任务结束 -> 超时告警恢复。
 		clk.Set(base.Add(150 * time.Second))
 		ingest(pipelineobs.Event{ID: "t1-fin", Pipeline: "p1", Operator: "agg", Kind: pipelineobs.KindTaskFinished, TaskID: "task-1", OccurredAt: base.Add(145 * time.Second)})
+
+		// 8) 任务卡死：任务起后再无任何事件，只推进时钟也判出卡死。
+		log.Println("--- 任务卡死（无进展）演示 ---")
+		ingest(pipelineobs.Event{ID: "t3-start", Pipeline: "p1", Operator: "join", Kind: pipelineobs.KindTaskStarted, TaskID: "task-3", OccurredAt: base.Add(150 * time.Second)})
+		clk.Set(base.Add(150*time.Second + 45*time.Second)) // 恰好达到卡死阈值
+		if _, err := eng.ObserveTime(ctx); err != nil {
+			log.Fatal(err)
+		}
+
+		// 9) 按范围静默：一次静默 join 算子名下全部问题；到期后自动重报。
+		log.Println("--- 算子范围静默（45s）---")
+		if _, err := eng.SilenceScoped(pipelineobs.SilenceScope{Pipeline: "p1", Operator: "join"}, 45*time.Second, "join 维护"); err != nil {
+			log.Fatal(err)
+		}
+		clk.Set(base.Add(210 * time.Second)) // 静默期内：不对外通知
+		if _, err := eng.ObserveTime(ctx); err != nil {
+			log.Fatal(err)
+		}
+		clk.Set(base.Add(241 * time.Second)) // 静默到期：问题仍在 -> 重新报警
+		if _, err := eng.ObserveTime(ctx); err != nil {
+			log.Fatal(err)
+		}
+		// 任务重新有产出 -> 卡死恢复。
+		ingest(pipelineobs.Event{ID: "t3-out", Pipeline: "p1", Operator: "join", Kind: pipelineobs.KindRecord, OccurredAt: base.Add(241 * time.Second)})
+
+		// 10) 运行健康汇总（只读，与活动告警严格一致）。
+		fmt.Println("\n=== 运行健康汇总 ===")
+		for _, p := range eng.Health() {
+			fmt.Printf("pipe=%s stuck=%t stale=%t activeAlerts=%d\n", p.Pipeline, p.Stuck, p.Stale, p.ActiveAlerts)
+			for _, o := range p.Operators {
+				fmt.Printf("  op=%-6s stuck=%t stale=%t running=%d activeAlerts=%d causes=%v\n",
+					o.Operator, o.Stuck, o.Stale, o.RunningTasks, o.ActiveAlerts, o.Causes)
+			}
+		}
 
 		log.Printf("快照已写入 %s，再次运行本程序可验证重启恢复（告警不刷屏、不丢失）。\n", snapPath)
 	} else {

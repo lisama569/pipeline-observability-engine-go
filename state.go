@@ -74,6 +74,11 @@ type taskState struct {
 	TimeoutAlerted bool `json:"timeout_alerted"`
 	// FailAlerted 标记本轮运行是否已产生过失败告警。
 	FailAlerted bool `json:"fail_alerted"`
+
+	// LastActivityAt 该任务所属算子最近一次有效事件的处理时间
+	// （单调有效时间）。卡死判定以此为准：任务运行期间算子完全静默
+	// 超过阈值即判卡死。任务开始事件本身即首次活动。
+	LastActivityAt time.Time `json:"last_activity_at,omitempty"`
 }
 
 // incidentState 是一条根因告警的持久化状态机。
@@ -94,17 +99,74 @@ type incidentState struct {
 	// Notified 标记当前 firing 轮次是否已对外产生过一条有效告警。
 	// 抑制窗口内重复条件成立只刷新 LastFiredAt，不再产生新告警。
 	Notified bool `json:"notified"`
+
+	// Silenced 标记最近一次评估时该事件单是否处于静默覆盖之下。
+	// 静默解除（到期/手动移除）后若条件仍成立，据此补发一条告警。
+	Silenced bool `json:"silenced,omitempty"`
+
+	// TaskID 仅任务失败类事件单使用，标识失败的任务实例。
+	TaskID string `json:"task_id,omitempty"`
 }
 
 // silenceState 是一条静默规则。
+//
+// 匹配口径（二选一，唯一确定）：
+//   - Key 非空：精确匹配某一告警根因键（兼容旧版逐根因静默）；
+//   - 否则按结构化范围匹配：Pipeline/Operator/Cause/TaskID 中
+//     非空字段必须全部等于事件单对应字段，空字段为通配。
+//     全部字段为空即全局静默。
 type silenceState struct {
 	// Until 为零值表示永久静默；否则到该处理时间为止。
 	Until time.Time `json:"until"`
 	Note  string    `json:"note"`
+
+	// Key 精确匹配的告警根因键（旧版 Silence 语义）。
+	Key string `json:"key,omitempty"`
+
+	// 结构化范围匹配字段（空串为通配）。
+	Pipeline string `json:"pipeline,omitempty"`
+	Operator string `json:"operator,omitempty"`
+	Cause    Cause  `json:"cause,omitempty"`
+	TaskID   string `json:"task_id,omitempty"`
 }
 
 // globalSilenceKey 是全局静默规则在 Silences 中的键。
 const globalSilenceKey = "*"
+
+// matches 判断规则是否覆盖给定事件单。
+func (sil silenceState) matches(inc *incidentState) bool {
+	if sil.Key != "" {
+		return sil.Key == inc.Key
+	}
+	if sil.Pipeline != "" && sil.Pipeline != inc.Pipeline {
+		return false
+	}
+	if sil.Operator != "" && sil.Operator != inc.Operator {
+		return false
+	}
+	if sil.Cause != "" && sil.Cause != inc.Cause {
+		return false
+	}
+	if sil.TaskID != "" && sil.TaskID != inc.TaskID {
+		return false
+	}
+	return true
+}
+
+// specificity 返回规则的具体程度（用于多条命中时唯一确定“生效规则”）：
+// 精确键最具体，其次按非空匹配字段个数计。
+func (sil silenceState) specificity() int {
+	if sil.Key != "" {
+		return 100
+	}
+	n := 0
+	for _, f := range []string{sil.Pipeline, sil.Operator, string(sil.Cause), sil.TaskID} {
+		if f != "" {
+			n++
+		}
+	}
+	return n
+}
 
 func newSnapshot() *snapshot {
 	return &snapshot{
@@ -149,6 +211,16 @@ func (s *snapshot) normalizeAfterLoad() error {
 	}
 	if s.LastIngest == nil {
 		s.LastIngest = map[string]time.Time{}
+	}
+	// 兼容旧版（v1 早期）快照：当时的静默只有“精确根因键”一种形态，
+	// 键即根因键、结构体无匹配字段。加载时把这类条目迁移为 Key 精确匹配，
+	// 避免被新口径误当作全局静默。
+	for k, sil := range s.Silences {
+		if k != globalSilenceKey && sil.Key == "" && sil.Pipeline == "" &&
+			sil.Operator == "" && sil.Cause == "" && sil.TaskID == "" {
+			sil.Key = k
+			s.Silences[k] = sil
+		}
 	}
 	return nil
 }
